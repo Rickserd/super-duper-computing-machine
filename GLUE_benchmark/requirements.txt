@@ -1,0 +1,31 @@
+# GLUE Benchmark Framework Requirements
+
+# Core ML
+torch>=2.0.0
+transformers>=4.36.0
+datasets>=2.14.0
+evaluate>=0.4.0
+accelerate>=0.24.0
+
+# Parameter-efficient fine-tuning
+peft>=0.7.0
+
+# Quantization (for QLoRA)
+bitsandbytes>=0.41.0
+
+# Flash Attention 2 (required for Hymba-1.5B)
+flash-attn>=2.5.0
+
+# NVML for GPU monitoring (one of these)
+pynvml>=11.5.0
+# nvidia-ml-py>=12.535.0  # Alternative to pynvml
+
+# Utilities
+numpy>=1.24.0
+packaging>=23.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# Optional: for better progress bars
+tqdm>=4.65.0
+
