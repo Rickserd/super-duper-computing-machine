@@ -1,6 +1,6 @@
 # GLUE Benchmark Framework
 
-A framework for fine-tuning small LLMs (Transformers and State-Space Models) on GLUE-style classification tasks with several fine-tuning methods, while measuring **GPU energy, power, VRAM, and inference latency**, and scoring runs with the **SAM (Sustainable AI Metric)**.
+A framework for fine-tuning small LLMs (Transformers and State-Space Models) on GLUE-style classification tasks with several fine-tuning methods. It measures **GPU energy, power, VRAM, and inference latency**, estimates **FLOPs**, and scores every run with **NetScore** and its efficiency variants (**NS, NS-E, NS-M, NS#**).
 
 ## Features
 
@@ -9,7 +9,8 @@ A framework for fine-tuning small LLMs (Transformers and State-Space Models) on 
 | **Models** | TinyLlama-1.1B, Qwen3-1.7B, Mamba-1 1.4B, Mamba-2 1.3B |
 | **Datasets** | SST-2, QNLI, CoLA, STS-B (regression), HellaSwag (4-way multiple choice) |
 | **Methods** | BitFit, Full fine-tuning, LoRA, LoRA+, QLoRA |
-| **Tracking** | NVML power/VRAM sampling during training, per-sample inference metrics, SAM@1/2/5 |
+| **Tracking** | NVML power/VRAM sampling during training, per-sample inference metrics, analytical FLOPs |
+| **Scoring** | NetScore variants NS / NS-E / NS-M / NS#, computed for both training cost and inference cost |
 
 Every run does the following:
 
@@ -18,7 +19,7 @@ Every run does the following:
 3. **Fine-tunes** with the Hugging Face `Trainer` while an NVML callback samples GPU power and VRAM.
 4. Runs a **post-training evaluation**, keeping the best checkpoint by the dataset's primary metric.
 5. Runs an **inference pass** one sample at a time over the eval split (latency, throughput, energy, peak VRAM).
-6. Computes SAM from both training energy and inference energy, deletes intermediate checkpoints, saves the model, and writes JSON results.
+6. Estimates **FLOPs**, computes the **NetScore variants** for the training cost and the inference cost, deletes intermediate checkpoints, saves the model, and writes JSON results.
 
 ---
 
@@ -70,7 +71,7 @@ python main.py --model tinyllama-1.1b --dataset hellaswag --method lora --max-le
 
 ### Sweeps
 
-`--model`, `--dataset`, and `--method` each accept `all`. The runs are the Cartesian product of the three, executed one after another. A failed run is logged and the sweep continues.
+`--model`, `--dataset`, and `--method` each accept `all`. The runs are the Cartesian product of the three, executed one after another. A failed run is logged and the sweep continues. The final summary table lists the training-cost NetScore variants for every successful run.
 
 ```bash
 python main.py --model tinyllama-1.1b --dataset sst2 --method all        # all methods
@@ -98,7 +99,7 @@ python main.py --model tinyllama-1.1b --dataset sst2 --method lora --debug
 | `--batch-size, -b` | `32` | Per-device train and eval batch size |
 | `--epochs, -e` | `5` | Training epochs (forced to 1 with `--debug`) |
 | `--learning-rate, -lr` | `1e-5` | Base learning rate |
-| `--max-length` | `128` | Max tokenized sequence length |
+| `--max-length` | `128` | Max tokenized sequence length (also the S used for FLOPs) |
 | `--grad-accum` | `1` | Gradient accumulation steps |
 | `--lora-r` | `16` | LoRA rank (LoRA, LoRA+, QLoRA) |
 | `--lora-alpha` | `32` | LoRA alpha |
@@ -114,7 +115,9 @@ python main.py --model tinyllama-1.1b --dataset sst2 --method lora --debug
 | `--quiet, -q` | off | Suppress per-run verbose logging |
 | `--debug` | off | 1 epoch, eval/save every 50 steps, log every 10 steps |
 
-Other defaults live in `TrainingConfig` in [config.py](config.py): `warmup_ratio=0.1`, `weight_decay=0.01`, `lora_dropout=0.1`, `save_total_limit=1`.
+Other defaults live in [config.py](config.py):
+- `TrainingConfig`: `warmup_ratio=0.1`, `weight_decay=0.01`, `lora_dropout=0.1`, `save_total_limit=1`
+- `NetScoreConfig`: S, α, variant exponents, and units
 
 ---
 
@@ -129,6 +132,8 @@ Defined in `MODELS` in [config.py](config.py).
 | `mamba-1.4b` | `state-spaces/mamba-1.4b-hf` | `x_proj, in_proj` | CausalLM with a custom last-token classification head, loaded in bf16. `dt_proj` is skipped during BnB quantization. |
 | `mamba2-1.3b` | `state-spaces/mamba2-1.3b` | `in_proj, x_proj` | Loaded through `mamba_ssm` and uses the GPT-NeoX-20B tokenizer. **Left padding** is required. The `classifier` head is fully trainable under PEFT. |
 
+Each model also has an `arch=ArchSpec(...)` entry with the layer and hidden dimensions used by the FLOPs model.
+
 **Custom heads** are in [utils/custom_models.py](utils/custom_models.py):
 
 - `CausalLMForSequenceClassification` wraps any HF CausalLM. It pools the hidden state of the last non-padding token and passes it through a linear `score` head. It uses MSE loss for regression and cross-entropy for classification.
@@ -140,7 +145,7 @@ When a custom-head model's configured LoRA target modules are missing, [utils/mo
 
 Defined in `DATASETS` in [config.py](config.py). Training uses the `train` split. Evaluation uses `validation`, or `test` when there is no validation split.
 
-| Key | Source | Task | Labels | Primary metric |
+| Key | Source | Task | Labels | Primary metric (NetScore a) |
 |---|---|---|---|---|
 | `sst2` | `glue/sst2` | Sentiment | 2 | Accuracy |
 | `qnli` | `glue/qnli` | Question/sentence NLI (pair) | 2 | Accuracy |
@@ -164,16 +169,16 @@ Implemented in [methods/](methods/). Each method subclasses `BaseTrainer` in [me
 
 **QLoRA with Mamba models:**
 
-- **mamba-1.4b:** If the directory in `quantized_model_path` (`./quantized_models/mamba-1.4b-gptq-4bit`) exists, QLoRA loads that GPTQ checkpoint instead of quantizing on the fly with bitsandbytes. This requires `auto-gptq` and `optimum`. The `qlora.py` docstring refers to a `quantize_mamba.py` script for creating the checkpoint.
+- **mamba-1.4b:** If the directory in `quantized_model_path` (`./quantized_models/mamba-1.4b-gptq-4bit`) exists, QLoRA loads that GPTQ checkpoint instead of quantizing on the fly with bitsandbytes. This requires `auto-gptq` and `optimum`.
 - **mamba2-1.3b:** QLoRA is **not supported** unless a pre-quantized checkpoint is available, because `mamba_ssm`'s fused CUDA kernels don't work with bitsandbytes. The run raises `NotImplementedError`, so use LoRA or LoRA+ instead.
 
 ---
 
-## Energy and efficiency measurement
+## Efficiency measurement and NetScore
 
-### Training ([utils/nvml_callback.py](utils/nvml_callback.py))
+### Training power and VRAM ([utils/nvml_callback.py](utils/nvml_callback.py))
 
-`CheckpointNVMLCallback` combines three sources. The first one that has data is used as the energy estimate:
+`CheckpointNVMLCallback` combines three sources. The first one that has data is used for the energy estimate:
 
 1. **Continuous sampling:** a background thread reads power and VRAM every `--nvml-sample-interval` ms.
 2. **Step sampling:** a reading every `--nvml-sample-every-n-steps` optimizer steps.
@@ -193,16 +198,51 @@ After training, the optimizer and scheduler are freed. The eval split is then ru
 
 It falls back to `nvidia-smi` when `pynvml` is unavailable.
 
-### SAM: Sustainable AI Metric ([utils/metrics.py](utils/metrics.py))
+### FLOPs ([utils/flops.py](utils/flops.py))
+
+FLOPs are estimated **analytically** from each model's `ArchSpec`. Values are per sequence of S = `max_length` tokens.
+
+| Quantity | FLOPs per sequence |
+|---|---|
+| Forward pass, F | Transformer: attention projections + attention core + SwiGLU MLP. Mamba-1/2: projections + conv + selective scan. The classification head is ignored. |
+| Adapter forward, A | 2 · S · trainable parameters |
+| Training: `full_ft` | 3F |
+| Training: `bitfit` | 2F |
+| Training: `lora`, `loraplus`, `qlora` | 2F + 3A |
+| Inference | F (adapters assumed merged) |
+
+A model without an `ArchSpec` falls back to F ≈ 2 · total parameters · S. Its results record `"source": "approx_2NS"`.
+
+### NetScore ([utils/metrics.py](utils/metrics.py))
 
 ```
-SAM@α = score^α × α / log(Wh)        (natural log; log(Wh + 1) is used when Wh ≤ 1)
+NetScore = S · log10( a^α / ( (p·m)^β · v^γ · t^δ · w^λ ) )        S = 20, α = 2
 ```
 
-- `score` is the dataset's primary metric (accuracy, MCC, or combined Pearson/Spearman).
-- `α ∈ {1, 2, 5}`.
-- SAM is computed twice: from **training** energy (`SAM@1/2/5`) and from **inference** energy (`SAM_inference`).
-- It is `null` when no energy data is available.
+The efficiency exponents act as switches that select which cost terms a variant includes. Non-zero efficiency exponents use 1/8, which gives task performance more weight than the 1/4 used in earlier NetScore extensions.
+
+| Variant | β (p×m) | γ (VRAM) | δ (time) | λ (power) | Penalizes |
+|---|---|---|---|---|---|
+| `NS` | 0.5 | 0 | 0 | 0 | Model size (parameters and FLOPs) |
+| `NS-E` | 0 | 0 | 0.125 | 0.125 | Energy (time and power) |
+| `NS-M` | 0 | 0.125 | 0 | 0 | Peak memory |
+| `NS#` | 0 | 0.125 | 0.125 | 0.125 | All efficiency terms |
+
+Every variant is computed twice, once for each cost:
+
+| Term | Unit | Training cost (`NetScore`) | Inference cost (`NetScore_inference`) |
+|---|---|---|---|
+| a | % | Fine-tuned primary metric × 100 | Same |
+| p | millions | Trainable parameters | Same |
+| m | millions of FLOPs | Training FLOPs per sequence | Forward FLOPs per sequence |
+| v | GiB | Peak NVML VRAM during training | Peak VRAM in the inference pass |
+| t | seconds | Fine-tuning wall time | Total inference-pass time |
+| w | W | Average power during training | Average power in the inference pass |
+
+- **Configuration:** S, α, the variant table, and the units are set in `NetScoreConfig` in [config.py](config.py).
+- **Units:** changing a unit shifts absolute values but doesn't change rankings within a variant.
+- **Missing values:** a variant is `null` when a ≤ 0 (possible for MCC and correlations), or when one of its non-zero-exponent terms is missing or zero (for example, no NVML data).
+- **Inputs:** the exact inputs, in NetScore units, are saved next to the scores as `netscore_inputs` and `netscore_inputs_inference`.
 
 ---
 
@@ -214,7 +254,7 @@ outputs/
 └── <model>/
     └── <dataset>/
         └── <method>_<YYYYmmdd_HHMMSS>/
-            ├── benchmark_results_<method>.json # metrics, params, energy, SAM, inference stats
+            ├── benchmark_results_<method>.json # metrics, params, energy, FLOPs, NetScore, inference stats
             ├── power_vram_timeseries.json      # step/checkpoint samples + summary
             ├── inference_stats.json            # aggregate + per-sample inference metrics
             └── model / adapter + tokenizer files (unless --no-save-model)
@@ -227,7 +267,8 @@ Key fields in `benchmark_results_<method>.json`:
 - **Training cost:** `training_time_minutes`, `final_training_loss`
 - **Power and memory:** `avg_gpu_power_watts`, `max_gpu_vram_used_mb`
 - **Energy:** `estimated_energy_Wh`, `energy_measurement_source`
-- **SAM:** `SAM@1`, `SAM@2`, `SAM@5`, `SAM_inference`
+- **FLOPs:** `flops` → `seq_len`, `forward_flops_per_sequence`, `training_flops_per_sequence`, `source`
+- **NetScore:** `NetScore`, `netscore_inputs` (training cost); `NetScore_inference`, `netscore_inputs_inference` (inference cost)
 - **Inference:** `inference_stats`
 
 Custom-head and Mamba-2 models are saved as `.bin` rather than safetensors, because their wrapper classes contain shared tensors.
@@ -239,7 +280,7 @@ Custom-head and Mamba-2 models are saved as `.bin` rather than safetensors, beca
 ```
 .
 ├── main.py                    # CLI entry point; builds the run matrix and prints the results table
-├── config.py                  # ModelConfig / DatasetConfig / TrainingConfig registries
+├── config.py                  # ModelConfig (+ ArchSpec) / DatasetConfig / TrainingConfig / NetScoreConfig
 ├── methods/
 │   ├── __init__.py            # TRAINER_REGISTRY + get_trainer()
 │   ├── base.py                # BaseTrainer: data, tokenization, Trainer, eval, inference pass, results
@@ -251,8 +292,9 @@ Custom-head and Mamba-2 models are saved as `.bin` rather than safetensors, beca
 └── utils/
     ├── custom_models.py       # CausalLM and Mamba2 sequence-classification wrappers
     ├── data_preprocessing.py  # Multiple-choice → single-sequence classification
+    ├── flops.py               # Analytical FLOPs model
     ├── inference_tracker.py   # GPUInferenceTracker
-    ├── metrics.py             # SAM calculation + metric helpers
+    ├── metrics.py             # NetScore calculation + metric helpers
     ├── module_discovery.py    # LoRA target-module auto-discovery
     ├── nvml_callback.py       # Training-time NVML power/VRAM callback
     └── seed.py                # set_seed() helper
@@ -271,13 +313,15 @@ MODELS["new-model"] = ModelConfig(
     hf_name="organization/model-name",
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     description="Description of the model",
+    arch=ArchSpec(                  # shapes for FLOPs; omit to use 2 · params · seq_len
+        family="transformer", num_layers=24, hidden_size=2048,
+        num_heads=16, num_kv_heads=8, head_dim=128, intermediate_size=5504,
+    ),
     # requires_custom_head=True,     # if there is no native SequenceClassification support
     # padding_side="left",
     # torch_dtype=torch.bfloat16,
 )
 ```
-
-Also add the key to the `--model` examples above.
 
 ### Add a dataset
 
@@ -306,11 +350,18 @@ DATASETS["new-dataset"] = DatasetConfig(
 1. Create `methods/my_method.py` with a `BaseTrainer` subclass. Set `method_name` and implement `_apply_method_specific_setup()`. Override `_load_model`, `_get_training_args`, or `_setup_trainer` if the method needs to.
 2. Register the class in `TRAINER_REGISTRY` in `methods/__init__.py`.
 3. Add its name to `METHODS` in `config.py`.
+4. If its training FLOPs differ from the defaults, add a case to `training_flops()` in `utils/flops.py`. The default is 3F when every weight is trained and 2F + 3A otherwise.
+
+### Add or change a NetScore variant
+
+Edit `NetScoreConfig.variants` in [config.py](config.py). Each entry maps a name to its `beta`, `gamma`, `delta`, and `lambda` exponents. Every variant listed there is computed, saved, and shown in the summary table automatically.
 
 ---
 
 ## Notes and caveats
 
+- **FLOPs are an upper bound for training.** They are computed at `max_length`, but training batches use dynamic padding, so real sequences are usually shorter. The inference pass pads every sample to `max_length`, so there the estimate matches.
+- **p is the trainable-parameter count** in every variant. As a result, `NS` separates PEFT methods sharply and penalizes full fine-tuning heavily.
 - **Experiment tracking:** `report_to=None` in `TrainingArguments` means "all installed integrations" on transformers 4.x. If `wandb` is installed, runs are logged to it. Set `WANDB_MODE=disabled` or uninstall it to opt out.
 - **Seeding:** `utils/seed.py` provides `set_seed()`, but `main.py` does not call it. Runs are not seeded beyond the `Trainer` default (seed 42).
 - **`--max-length` default:** the CLI default is **128**, which overrides `TrainingConfig.max_length = 256`.

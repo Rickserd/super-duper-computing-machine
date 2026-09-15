@@ -15,6 +15,25 @@ import torch
 # ============================================================================
 
 @dataclass
+class ArchSpec:
+    """Architecture shapes used by the analytical FLOPs model (utils/flops.py)."""
+    family: str  # "transformer" | "mamba1" | "mamba2"
+    num_layers: int
+    hidden_size: int  # d_model for Mamba
+    # Transformer (num_heads is also the SSM head count for Mamba-2)
+    num_heads: int = 0
+    num_kv_heads: int = 0
+    head_dim: int = 0
+    intermediate_size: int = 0
+    # Mamba
+    d_inner: int = 0
+    d_state: int = 0
+    d_conv: int = 4
+    dt_rank: int = 0
+    ngroups: int = 1
+
+
+@dataclass
 class ModelConfig:
     """Configuration for a model."""
     name: str
@@ -29,6 +48,7 @@ class ModelConfig:
     torch_dtype: Optional[torch.dtype] = None  # Override dtype for loading (e.g. bf16 for fp32 models)
     quantization_skip_modules: Optional[List[str]] = None  # Modules to keep in full precision during quantization
     quantized_model_path: Optional[str] = None  # Path to pre-quantized model (for QLoRA with Mamba etc.)
+    arch: Optional[ArchSpec] = None  # Shapes for analytical FLOPs (None -> 2 * params * seq_len approximation)
 
 
 MODELS: Dict[str, ModelConfig] = {
@@ -37,12 +57,20 @@ MODELS: Dict[str, ModelConfig] = {
         hf_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         description="TinyLlama 1.1B Chat model",
+        arch=ArchSpec(
+            family="transformer", num_layers=22, hidden_size=2048,
+            num_heads=32, num_kv_heads=4, head_dim=64, intermediate_size=5632,
+        ),
     ),
     "qwen3-1.7b": ModelConfig(
         name="qwen3-1.7b",
         hf_name="Qwen/Qwen3-1.7B",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         description="Qwen3 1.7B model",
+        arch=ArchSpec(
+            family="transformer", num_layers=28, hidden_size=2048,
+            num_heads=16, num_kv_heads=8, head_dim=128, intermediate_size=6144,
+        ),
     ),
     "mamba-1.4b": ModelConfig(
         name="mamba-1.4b",
@@ -53,6 +81,10 @@ MODELS: Dict[str, ModelConfig] = {
         torch_dtype=torch.bfloat16,
         quantization_skip_modules=["dt_proj"],  # dt_proj.weight accessed directly in Mamba mixer
         quantized_model_path="./quantized_models/mamba-1.4b-gptq-4bit",  # GPTQ pre-quantized for QLoRA
+        arch=ArchSpec(
+            family="mamba1", num_layers=48, hidden_size=2048,
+            d_inner=4096, d_state=16, d_conv=4, dt_rank=128,
+        ),
     ),
     "mamba2-1.3b": ModelConfig(
         name="mamba2-1.3b",
@@ -64,6 +96,10 @@ MODELS: Dict[str, ModelConfig] = {
         padding_side="left",  # Right-padding propagates noise in Mamba2
         modules_to_save=["classifier"],  # Keep classification head fully trainable in PEFT
         torch_dtype=torch.bfloat16,
+        arch=ArchSpec(
+            family="mamba2", num_layers=48, hidden_size=2048,
+            num_heads=64, d_inner=4096, d_state=128, d_conv=4, ngroups=1,
+        ),
     ),
 }
 
@@ -185,6 +221,39 @@ DATASETS: Dict[str, DatasetConfig] = {
 # ============================================================================
 
 METHODS = ["bitfit", "full_ft", "lora", "loraplus", "qlora"]
+
+
+# ============================================================================
+# NetScore Configuration
+# ============================================================================
+
+@dataclass
+class NetScoreConfig:
+    """
+    NetScore = S * log10( a^alpha / ((p*m)^beta * v^gamma * t^delta * w^lambda) )
+
+    a: task performance, p: trainable parameters, m: FLOPs per sequence,
+    v: peak VRAM, t: fine-tuning (or inference) time, w: average power.
+    """
+    scale: float = 20.0  # S
+    alpha: float = 2.0   # Performance exponent
+    # Efficiency exponents per variant; non-zero exponents use 1/8 = 0.125
+    variants: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        "NS":   {"beta": 0.5, "gamma": 0.0,   "delta": 0.0,   "lambda": 0.0},    # params x FLOPs
+        "NS-E": {"beta": 0.0, "gamma": 0.0,   "delta": 0.125, "lambda": 0.125},  # energy: time + power
+        "NS-M": {"beta": 0.0, "gamma": 0.125, "delta": 0.0,   "lambda": 0.0},    # peak memory
+        "NS#":  {"beta": 0.0, "gamma": 0.125, "delta": 0.125, "lambda": 0.125},  # all efficiency terms
+    })
+    # Units: a = metric * performance_scale; every other raw value is divided by its unit
+    performance_scale: float = 100.0  # a in %
+    params_unit: float = 1e6          # p in millions
+    flops_unit: float = 1e6           # m in millions of FLOPs
+    vram_mb_unit: float = 1024.0      # v in GiB (raw values are MiB)
+    time_s_unit: float = 1.0          # t in seconds
+    power_w_unit: float = 1.0         # w in Watts
+
+
+NETSCORE = NetScoreConfig()
 
 
 # ============================================================================

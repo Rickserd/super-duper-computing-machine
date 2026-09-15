@@ -11,7 +11,7 @@ Features:
 - Multiple datasets: SST-2, QNLI, CoLA, STS-B, HellaSwag
 - Multiple methods: BitFit, Full FT, LoRA, LoRA+, QLoRA
 - Energy efficiency tracking via NVML
-- SAM metric calculation
+- NetScore variants (NS, NS-E, NS-M, NS#) for training and inference cost
 
 Usage:
     # Single run
@@ -42,7 +42,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from config import (
     MODELS, DATASETS, METHODS,
     get_model_config, get_dataset_config,
-    TrainingConfig,
+    TrainingConfig, NETSCORE,
 )
 from methods import get_trainer
 
@@ -370,11 +370,12 @@ def main():
     
     # Print results table
     if successful > 0:
-        print("\n📊 Results Summary:")
-        print("-"*100)
-        header = f"{'Model':<20} {'Dataset':<10} {'Method':<12} {'Metric':<10} {'Score':<10} {'Energy(Wh)':<12} {'SAM@1':<12}"
+        print("\n📊 Results Summary (NetScore from training cost):")
+        ns_header = " ".join(f"{name:>8}" for name in NETSCORE.variants)
+        header = f"{'Model':<20} {'Dataset':<10} {'Method':<12} {'Metric':<10} {'Score':<10} {'Energy(Wh)':<12} {ns_header}"
+        print("-"*len(header))
         print(header)
-        print("-"*100)
+        print("-"*len(header))
         
         for r in all_results:
             if r["status"] == "success":
@@ -384,12 +385,15 @@ def main():
                 metric = r.get("metric_name", "acc")
                 score = r.get(f"fine_tuned_{metric}", r.get("fine_tuned_accuracy", 0))
                 energy = r.get("estimated_energy_Wh")
-                sam1 = r.get("SAM@1")
+                netscore = r.get("NetScore") or {}
                 
                 energy_str = f"{energy:.4f}" if energy else "N/A"
-                sam1_str = f"{sam1:.6f}" if sam1 else "N/A"
+                ns_str = " ".join(
+                    f"{netscore[name]:>8.2f}" if netscore.get(name) is not None else f"{'N/A':>8}"
+                    for name in NETSCORE.variants
+                )
                 
-                print(f"{model:<20} {dataset:<10} {method:<12} {metric:<10} {score:<10.4f} {energy_str:<12} {sam1_str:<12}")
+                print(f"{model:<20} {dataset:<10} {method:<12} {metric:<10} {score:<10.4f} {energy_str:<12} {ns_str}")
         
         print("-"*100)
     
