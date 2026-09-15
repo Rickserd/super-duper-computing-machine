@@ -26,7 +26,8 @@ from tqdm import tqdm
 
 from config import ModelConfig, DatasetConfig, TrainingConfig
 from utils.nvml_callback import CheckpointNVMLCallback, NVML_OK
-from utils.metrics import compute_sam_metrics, format_sam_results
+from utils.metrics import compute_netscore_variants, to_netscore_inputs, format_netscore_results
+from utils.flops import estimate_flops
 from utils.inference_tracker import GPUInferenceTracker
 
 
@@ -418,15 +419,40 @@ class BaseTrainer(ABC):
             if "peak_allocator_mb" in s:
                 avg_peak_alloc_mb = s["peak_allocator_mb"].get("avg")
         
-        # Calculate SAM metrics (training energy)
-        sam_metrics = compute_sam_metrics(ft_metric, energy_wh)
+        # Analytical FLOPs (per sequence of max_length tokens) for the NetScore m term
+        trainable_params = self.results.get("trainable_parameters")
+        flops = estimate_flops(
+            self.model_config,
+            self.method_name,
+            seq_len=self.training_config.max_length,
+            trainable_params=trainable_params,
+            total_params=self.results.get("total_parameters"),
+        )
+
+        # NetScore variants (training cost)
+        netscore_inputs = to_netscore_inputs(
+            performance=ft_metric,
+            params=trainable_params,
+            flops=flops["training_flops_per_sequence"],
+            vram_mb=max_vram_used_mb,
+            time_s=self.training_time_seconds,
+            power_w=avg_power_w,
+        )
+        netscore = compute_netscore_variants(netscore_inputs)
         
         # Run inference metrics collection pass
         inference_stats = self._run_inference_metrics()
         
-        # Calculate SAM metrics based on inference energy
-        inference_energy_wh = inference_stats.get("total_energy_wh") if inference_stats else None
-        sam_metrics_inference = compute_sam_metrics(ft_metric, inference_energy_wh)
+        # NetScore variants (inference cost): forward FLOPs, inference-pass VRAM/time/power
+        netscore_inputs_inference = to_netscore_inputs(
+            performance=ft_metric,
+            params=trainable_params,
+            flops=flops["forward_flops_per_sequence"],
+            vram_mb=inference_stats.get("peak_vram_mb") if inference_stats else None,
+            time_s=inference_stats.get("total_time_s") if inference_stats else None,
+            power_w=inference_stats.get("avg_power_w") if inference_stats else None,
+        )
+        netscore_inference = compute_netscore_variants(netscore_inputs_inference)
         
         # Remove intermediate checkpoints (checkpoint-*) before saving final model
         self._remove_checkpoints()
@@ -465,12 +491,17 @@ class BaseTrainer(ABC):
             "estimated_energy_Wh": energy_wh,
             "energy_measurement_source": energy_source,
             
-            # SAM metrics (training energy)
-            **sam_metrics,
+            # FLOPs (analytical, per sequence of max_length tokens)
+            "flops": flops,
+
+            # NetScore variants (training cost) and their inputs in NetScore units
+            "NetScore": netscore,
+            "netscore_inputs": netscore_inputs,
             
             # Inference metrics
             "inference_stats": inference_stats,
-            "SAM_inference": sam_metrics_inference,
+            "NetScore_inference": netscore_inference,
+            "netscore_inputs_inference": netscore_inputs_inference,
         })
         
         # Save results to JSON
@@ -491,8 +522,8 @@ class BaseTrainer(ABC):
         # Print summary
         self._print_summary(zs_metric, ft_metric, improvement, avg_power_w, 
                           avg_vram_used_mb, max_vram_used_mb, energy_wh, 
-                          energy_source, sam_metrics, num_samples,
-                          inference_stats, sam_metrics_inference)
+                          energy_source, netscore, num_samples,
+                          inference_stats, netscore_inference)
         
         return self.results
     
@@ -610,8 +641,8 @@ class BaseTrainer(ABC):
     
     def _print_summary(self, zs_metric, ft_metric, improvement, avg_power_w,
                       avg_vram_used_mb, max_vram_used_mb, energy_wh, 
-                      energy_source, sam_metrics, num_samples,
-                      inference_stats=None, sam_metrics_inference=None):
+                      energy_source, netscore, num_samples,
+                      inference_stats=None, netscore_inference=None):
         """Print training and inference summary."""
         self.log(f"\n{'='*70}")
         self.log(f"🏁 {self.method_name.upper()} FINE-TUNING SUMMARY")
@@ -636,8 +667,8 @@ class BaseTrainer(ABC):
             if energy_source:
                 self.log(f"   • Measurement source: {energy_source}")
         
-        self.log(f"\n📈 SAM Metrics (training energy):")
-        self.log(format_sam_results(sam_metrics))
+        self.log(f"\n📈 NetScore (training cost):")
+        self.log(format_netscore_results(netscore))
         
         if inference_stats:
             self.log(f"\n🔬 Inference Metrics:")
@@ -648,9 +679,9 @@ class BaseTrainer(ABC):
             self.log(f"   • Avg power (inference): {inference_stats['avg_power_w']:.2f} W")
             self.log(f"   • Peak VRAM (inference): {inference_stats['peak_vram_mb']:.2f} MiB")
         
-        if sam_metrics_inference:
-            self.log(f"\n📈 SAM Metrics (inference energy):")
-            self.log(format_sam_results(sam_metrics_inference))
+        if netscore_inference:
+            self.log(f"\n📈 NetScore (inference cost):")
+            self.log(format_netscore_results(netscore_inference))
         
         self.log(f"\n💾 Model saved to: {self.output_dir}")
 
