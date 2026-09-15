@@ -1,90 +1,132 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Metrics utilities including SAM (Sustainable AI Metric) calculation.
+Metrics utilities including NetScore calculation.
 
-SAM(a) = acc^a × a / log(Wh)
+NetScore = S · log10( a^α / ((p·m)^β · v^γ · t^δ · w^λ) )
 
 Where:
-- acc: accuracy (or other performance metric, e.g., MCC for CoLA, Pearson/Spearman for STS-B)
-- a: exponent parameter (commonly 1, 2, or 5)
-- Wh: energy consumption in Watt-hours
+- a: task performance (accuracy, MCC for CoLA, combined Pearson/Spearman for STS-B)
+- p: number of trainable parameters
+- m: FLOPs per sequence (see utils/flops.py)
+- v: peak VRAM
+- t: fine-tuning (or inference) time
+- w: average power draw
+- S, α: scale and performance exponent (S = 20, α = 2)
+- β, γ, δ, λ: efficiency exponents that switch cost terms on or off per variant
+  (NS, NS-E, NS-M, NS#; see NetScoreConfig in config.py)
 """
 
 import math
-from typing import Dict, Optional, List
+from typing import Dict, Optional
+
 import numpy as np
 
+from config import NETSCORE, NetScoreConfig
 
-def calculate_sam(
-    accuracy: float,
-    energy_wh: float,
-    alpha: int = 1,
-    min_energy_wh: float = 1e-6,
+
+def calculate_netscore(
+    a: Optional[float],
+    p: Optional[float],
+    m: Optional[float],
+    v: Optional[float],
+    t: Optional[float],
+    w: Optional[float],
+    beta: float,
+    gamma: float,
+    delta: float,
+    lam: float,
+    scale: float = 20.0,
+    alpha: float = 2.0,
 ) -> Optional[float]:
     """
-    Calculate SAM (Sustainable AI Metric).
-    
-    SAM(a) = acc^a × a / log(Wh)
-    
-    Args:
-        accuracy: Performance metric (accuracy, MCC, etc.) in [0, 1] range
-        energy_wh: Energy consumption in Watt-hours
-        alpha: Exponent parameter (commonly 1, 2, or 5)
-        min_energy_wh: Minimum energy value to avoid log(0) issues
-        
+    Calculate a single NetScore value.
+
+    Inputs must already be in NetScore units (see ``to_netscore_inputs``).
+    A term whose exponent is 0 is ignored, so its value may be None.
+
     Returns:
-        SAM value or None if calculation is not possible
+        NetScore value, or None if performance is not positive or a term with a
+        non-zero exponent is missing or not positive (log10 undefined).
     """
-    if energy_wh is None or energy_wh <= 0:
+    if a is None or not a > 0:
         return None
-    
-    # Ensure energy is at least min_energy_wh to avoid log issues
-    energy_wh = max(energy_wh, min_energy_wh)
-    
-    # Avoid log(1) = 0 which would cause division by zero
-    if energy_wh <= 1.0:
-        # Use natural log shifted by 1 to ensure positive denominator
-        # log(Wh + 1) for small values
-        log_energy = math.log(energy_wh + 1)
-    else:
-        log_energy = math.log(energy_wh)
-    
-    if log_energy == 0:
-        return None
-    
-    # SAM(a) = acc^a × a / log(Wh)
-    sam = (accuracy ** alpha) * alpha / log_energy
-    
-    return sam
+
+    # Evaluated in log space: S · (α·log a − β·log p − β·log m − γ·log v − δ·log t − λ·log w)
+    log_ratio = alpha * math.log10(a)
+    for exponent, value in ((beta, p), (beta, m), (gamma, v), (delta, t), (lam, w)):
+        if exponent == 0:
+            continue
+        if value is None or not value > 0:
+            return None
+        log_ratio -= exponent * math.log10(value)
+
+    return scale * log_ratio
 
 
-def compute_sam_metrics(
-    accuracy: float,
-    energy_wh: Optional[float],
-    alphas: List[int] = [1, 2, 5],
+def to_netscore_inputs(
+    performance: Optional[float],
+    params: Optional[float],
+    flops: Optional[float],
+    vram_mb: Optional[float],
+    time_s: Optional[float],
+    power_w: Optional[float],
+    cfg: NetScoreConfig = NETSCORE,
 ) -> Dict[str, Optional[float]]:
     """
-    Compute SAM metrics for multiple alpha values.
-    
+    Convert raw measurements into NetScore units.
+
     Args:
-        accuracy: Performance metric in [0, 1] range
-        energy_wh: Energy consumption in Watt-hours
-        alphas: List of alpha values to compute SAM for
-        
+        performance: Primary task metric in [0, 1] (or [-1, 1] for correlations)
+        params: Trainable parameter count
+        flops: FLOPs per sequence
+        vram_mb: Peak VRAM in MiB
+        time_s: Fine-tuning or inference time in seconds
+        power_w: Average power draw in Watts
+        cfg: NetScore configuration holding the unit conversions
+
     Returns:
-        Dictionary with SAM values for each alpha
+        Dictionary with keys a, p, m, v, t, w
     """
-    results = {}
-    
-    for alpha in alphas:
-        key = f"SAM@{alpha}"
-        if energy_wh is not None and energy_wh > 0:
-            results[key] = calculate_sam(accuracy, energy_wh, alpha)
-        else:
-            results[key] = None
-    
-    return results
+    def convert(value, unit):
+        return None if value is None else float(value) / unit
+
+    return {
+        "a": None if performance is None else float(performance) * cfg.performance_scale,
+        "p": convert(params, cfg.params_unit),
+        "m": convert(flops, cfg.flops_unit),
+        "v": convert(vram_mb, cfg.vram_mb_unit),
+        "t": convert(time_s, cfg.time_s_unit),
+        "w": convert(power_w, cfg.power_w_unit),
+    }
+
+
+def compute_netscore_variants(
+    inputs: Dict[str, Optional[float]],
+    cfg: NetScoreConfig = NETSCORE,
+) -> Dict[str, Optional[float]]:
+    """
+    Compute every configured NetScore variant (NS, NS-E, NS-M, NS#).
+
+    Args:
+        inputs: Output of ``to_netscore_inputs``
+        cfg: NetScore configuration (scale, alpha, variant exponents)
+
+    Returns:
+        Dictionary mapping variant name to its value (None if not computable)
+    """
+    return {
+        name: calculate_netscore(
+            inputs["a"], inputs["p"], inputs["m"], inputs["v"], inputs["t"], inputs["w"],
+            beta=exps["beta"],
+            gamma=exps["gamma"],
+            delta=exps["delta"],
+            lam=exps["lambda"],
+            scale=cfg.scale,
+            alpha=cfg.alpha,
+        )
+        for name, exps in cfg.variants.items()
+    }
 
 
 def compute_metrics_for_dataset(
@@ -93,19 +135,19 @@ def compute_metrics_for_dataset(
 ):
     """
     Compute metrics for a given dataset.
-    
+
     Args:
         eval_pred: Tuple of (logits, labels)
         metric_name: Name of the metric to compute
             ('accuracy', 'matthews_correlation', or 'pearson_spearman')
-        
+
     Returns:
         Dictionary with computed metrics
     """
     import evaluate
-    
+
     logits, labels = eval_pred
-    
+
     if metric_name == "pearson_spearman":
         preds = logits.squeeze(-1)
         pearson_metric = evaluate.load("pearsonr")
@@ -117,9 +159,9 @@ def compute_metrics_for_dataset(
             "spearman": spearman,
             "combined_score": (pearson + spearman) / 2.0,
         }
-    
+
     preds = np.argmax(logits, axis=1)
-    
+
     if metric_name == "accuracy":
         metric = evaluate.load("accuracy")
         return metric.compute(predictions=preds, references=labels)
@@ -131,13 +173,12 @@ def compute_metrics_for_dataset(
         return metric.compute(predictions=preds, references=labels)
 
 
-def format_sam_results(sam_metrics: Dict[str, Optional[float]]) -> str:
-    """Format SAM metrics for display."""
+def format_netscore_results(netscore: Dict[str, Optional[float]]) -> str:
+    """Format NetScore variants for display."""
     lines = []
-    for key, value in sam_metrics.items():
+    for key, value in netscore.items():
         if value is not None:
-            lines.append(f"   • {key}: {value:.6f}")
+            lines.append(f"   • {key}: {value:.4f}")
         else:
-            lines.append(f"   • {key}: N/A (no energy data)")
+            lines.append(f"   • {key}: N/A (missing or non-positive inputs)")
     return "\n".join(lines)
-
